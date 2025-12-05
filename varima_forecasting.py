@@ -13,10 +13,11 @@ import seaborn as sns
 
 # Darts imports
 from darts import TimeSeries
-from darts.models import VARIMA, LinearRegressionModel, NaiveSeasonal
+from darts.models import VARIMA, Theta, NaiveSeasonal
 from darts.metrics import smape, mase, mae, mse, rmse
 from darts.dataprocessing.transformers import Scaler, MissingValuesFiller
 from darts.utils.statistics import check_seasonality
+from darts.utils.utils import SeasonalityMode
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -200,6 +201,29 @@ class ModelTraining:
         )
 
     @staticmethod
+    def forecast_trend(
+        series: pd.Series, 
+        train_split_date: Any
+    ) -> TimeSeries:
+        """
+        Fits a Theta model to extrapolate the trend. 
+        """
+        full_trend_ts = TimeSeries.from_series(series)
+        train_trend_ts = full_trend_ts.drop_after(train_split_date)
+        
+        # Theta(2) is equivalent to linear extrapolation
+        model = Theta(theta=2, season_mode=SeasonalityMode.NONE) 
+        
+        return model.historical_forecasts(
+            series=full_trend_ts,
+            start=len(train_trend_ts),
+            forecast_horizon=1,
+            stride=1,
+            retrain=True,
+            verbose=False
+        )
+
+    @staticmethod
     def forecast_seasonal(
         series: pd.Series, 
         train_split_date: Any, 
@@ -302,14 +326,43 @@ class Visualization:
             plt.close()
 
     @staticmethod
-    def plot_forecast(y_true: pd.Series, y_pred: pd.Series, target_name: str, output_dir: Path):
-        """Plot actual vs forecast."""
-        plt.figure(figsize=(12, 6))
-        plt.plot(y_true.index, y_true.values, label='Actual')
-        plt.plot(y_pred.index, y_pred.values, label='Forecast', color='red')
-        plt.title(f'Forecast vs Actual: {target_name}')
-        plt.legend()
-        plt.savefig(output_dir / f"{target_name}_forecast.png")
+    def plot_forecast_components(
+        target_name: str,
+        y_true: pd.Series,
+        y_pred: pd.Series,
+        actual_components: pd.DataFrame,
+        pred_components: Dict[str, pd.Series],
+        output_dir: Path
+    ):
+        """Plot Actual vs Forecast for Total and Components."""
+        fig, axes = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
+        
+        # Total
+        axes[0].plot(y_true.index, y_true.values, label='Actual', color='black')
+        axes[0].plot(y_pred.index, y_pred.values, label='Forecast', color='red', linestyle='--')
+        axes[0].set_title(f'{target_name} - Total')
+        axes[0].legend()
+        
+        # Trend
+        axes[1].plot(actual_components.index, actual_components['trend'].values, label='Actual Trend')
+        axes[1].plot(pred_components['trend'].index, pred_components['trend'].values, label='Forecast Trend', color='red', linestyle='--')
+        axes[1].set_title(f'{target_name} - Trend')
+        axes[1].legend()
+
+        # Seasonal
+        axes[2].plot(actual_components.index, actual_components['seasonal'].values, label='Actual Seasonal')
+        axes[2].plot(pred_components['seasonal'].index, pred_components['seasonal'].values, label='Forecast Seasonal', color='red', linestyle='--')
+        axes[2].set_title(f'{target_name} - Seasonal')
+        axes[2].legend()
+
+        # Residual
+        axes[3].plot(actual_components.index, actual_components['residual'].values, label='Actual Residual')
+        axes[3].plot(pred_components['residual'].index, pred_components['residual'].values, label='Forecast Residual', color='red', linestyle='--')
+        axes[3].set_title(f'{target_name} - Residual')
+        axes[3].legend()
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / f"{target_name}_forecast_components.png")
         plt.close()
 
 
@@ -354,50 +407,6 @@ def run_varima_pipeline():
     Visualization.plot_decomposition(components, OUTPUT_DIR)
     
     # 3. Modeling & Forecasting
-
-    # Prepare Trends for SVR (Multivariate)
-    try:
-        train_trend_multi, test_trend_multi = prep.prepare_multivariate_series(
-            components, 
-            train_df.index, 
-            test_df.index,
-            col_name='trend'
-        )
-    except ValueError as e:
-        logger.error(str(e))
-        return
-        
-    # Hyperparameter Tuning for Linear Regression (Trend)
-    logger.info("Starting Hyperparameter Tuning for Linear Regression (Trend)...")
-    
-    parameters = {
-        'lags': [4, 8, 12, 26, 52]
-    }
-    
-    try:
-        best_model, best_params, best_score = ModelTraining.perform_grid_search(
-            LinearRegressionModel, parameters, train_trend_multi
-        )
-        logger.info(f"Best Linear Regression parameters: {best_params} with MSE={best_score}")
-        
-    except Exception as e:
-        logger.warning(f"Grid search failed: {str(e)}. Using default LinearRegressionModel(lags=4)")
-        best_model = LinearRegressionModel(lags=4)
-        
-    # Fit best model on full train residuals
-    best_model.fit(train_trend_multi)
-    
-    # Historical Forecasts (on Test set)
-    full_trend_multi = train_trend_multi.append(test_trend_multi)
-    
-    hist_pred_trend = best_model.historical_forecasts(
-        series=full_trend_multi,
-        start=len(train_trend_multi),
-        forecast_horizon=1,
-        stride=1,
-        retrain=False,
-        verbose=True
-    )
     
     # Prepare Residuals for VARIMA (Multivariate)
     try:
@@ -416,7 +425,7 @@ def run_varima_pipeline():
         'p': [1, 2, 3],
         'd': [0, 1],
         'q': [0, 1, 2],
-        'trend': ['c']
+        'trend': ['n']
     }
     
     try:
@@ -427,7 +436,7 @@ def run_varima_pipeline():
         
     except Exception as e:
         logger.warning(f"Grid search failed: {str(e)}. Using default VARIMA(1,0,0)")
-        best_model = VARIMA(p=1, d=0, q=0, trend='None')
+        best_model = VARIMA(p=1, d=0, q=0, trend='n')
         
     # Fit best model on full train residuals
     best_model.fit(train_res_multi)
@@ -450,8 +459,12 @@ def run_varima_pipeline():
             continue
             
         # 1. Component Predictions
-        trend_pred = hist_pred_trend.univariate_component(i)
         res_pred = hist_pred_res.univariate_component(i)
+
+        trend_pred = ModelTraining.forecast_trend(
+            series=components[target]['trend'],
+            train_split_date=train_df.index[-1]
+        )
         
         seasonal_pred = ModelTraining.forecast_seasonal(
             series=components[target]['seasonal'],
@@ -475,8 +488,16 @@ def run_varima_pipeline():
             json.dump(metrics, f, indent=4)
             
         # Plot
-        preds = pd.Series(final_pred_series.values().flatten(), index=final_pred_series.time_index)
-        Visualization.plot_forecast(actuals, preds, target, OUTPUT_DIR)
+        preds = pd.Series(final_pred_series.values().flatten(), index=common_index)
+        
+        act_comps = components[target].loc[common_index]
+        pred_comps = {
+            'trend': pd.Series(trend_pred.values().flatten(), index=trend_pred.time_index),
+            'seasonal': pd.Series(seasonal_pred.values().flatten(), index=seasonal_pred.time_index),
+            'residual': pd.Series(res_pred.values().flatten(), index=res_pred.time_index)
+        }
+        
+        Visualization.plot_forecast_components(target, actuals, preds, act_comps, pred_comps, OUTPUT_DIR)
         
     logger.info("Pipeline completed successfully.")
 
