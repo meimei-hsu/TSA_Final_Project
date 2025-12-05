@@ -146,6 +146,107 @@ class DataPreparation:
             
         return components
 
+    def prepare_multivariate_series(self, data: Dict[str, pd.DataFrame], train_index: pd.Index, 
+                                    test_index: pd.Index, col_name: str) -> Tuple[TimeSeries, TimeSeries]:
+        """
+        Prepare multivariate TimeSeries from a dictionary of DataFrames.
+        """
+        # Collect relevant series
+        series_list = []
+        for target in self.target_cols:
+            if target in data and col_name in data[target].columns:
+                series_list.append(data[target][col_name].rename(target))
+        
+        if not series_list:
+            raise ValueError(f"No valid data found for column '{col_name}'")
+            
+        # Create unified DataFrame (inner join for alignment)
+        multi_df = pd.concat(series_list, axis=1, join='inner')
+        
+        # Split based on provided indices
+        train_df = multi_df.loc[multi_df.index.isin(train_index)]
+        test_df = multi_df.loc[multi_df.index.isin(test_index)]
+        
+        if train_df.empty:
+            raise ValueError("Training set is empty after alignment")
+            
+        # Convert to Darts TimeSeries
+        return TimeSeries.from_dataframe(train_df), TimeSeries.from_dataframe(test_df)
+
+
+class ModelTraining:
+    """
+    Handles model training and hyperparameter tuning.
+    """
+    @staticmethod
+    def perform_grid_search(
+        model_entity, 
+        parameters: Dict[str, Any], 
+        series: TimeSeries, 
+        metric=mse,
+        val_len: int = 12
+    ) -> Tuple[Any, Dict[str, Any], float]:
+        """
+        Perform grid search with validation on the last `val_len` points of `series`.
+        """
+        train = series[:-val_len]
+        val = series[-val_len:]
+        
+        return model_entity.gridsearch(
+            parameters=parameters,
+            series=train,
+            val_series=val,
+            metric=metric
+        )
+
+    @staticmethod
+    def forecast_seasonal(
+        series: pd.Series, 
+        train_split_date: Any, 
+        period: int
+    ) -> TimeSeries:
+        """
+        Forecast seasonal component using NaiveSeasonal.
+        """
+        full_seasonal_ts = TimeSeries.from_series(series)
+        train_seasonal_ts = full_seasonal_ts.drop_after(train_split_date)
+        
+        seasonal_model = NaiveSeasonal(K=period)
+        seasonal_model.fit(train_seasonal_ts)
+        
+        return seasonal_model.historical_forecasts(
+            series=full_seasonal_ts,
+            start=len(train_seasonal_ts),
+            forecast_horizon=1,
+            stride=1,
+            retrain=True,
+            verbose=False
+        )
+
+    @staticmethod
+    def combine_predictions(predictions: List[TimeSeries]) -> TimeSeries:
+        """
+        Align multiple TimeSeries on their common time index and sum them up.
+        """
+        if not predictions:
+            raise ValueError("No predictions provided")
+            
+        # Find common intersection
+        common_index = predictions[0].time_index
+        for ts in predictions[1:]:
+            common_index = common_index.intersection(ts.time_index)
+            
+        if common_index.empty:
+            raise ValueError("No overlapping time index found")
+            
+        # Sum values on common index
+        final_values = sum(
+            ts.slice(common_index[0], common_index[-1]).values().flatten() 
+            for ts in predictions
+        )
+            
+        return TimeSeries.from_times_and_values(common_index, final_values)
+
 
 class Evaluator:
     """
@@ -253,88 +354,90 @@ def run_varima_pipeline():
     Visualization.plot_decomposition(components, OUTPUT_DIR)
     
     # 3. Modeling & Forecasting
-    
-    # Prepare Residuals for VARIMA (Multivariate)
-    train_residuals = []
-    test_residuals = []
-    
-    for target in targets:
-        if target not in components:
-            continue
-        
-        comp = components[target]
-        # Split components back to train/test (align indices)
-        train_idx = comp.index.intersection(train_df.index)
-        test_idx = comp.index.intersection(test_df.index)
-        
-        train_comp = comp.loc[train_idx]
-        test_comp = comp.loc[test_idx]
-        
-        train_residuals.append(TimeSeries.from_series(train_comp['residual']))
-        test_residuals.append(TimeSeries.from_series(test_comp['residual']))
-    
-    if not train_residuals:
-        logger.error("No targets found for modeling")
-        return
 
-    # Create multivariate series
-    train_res_multi = train_residuals[0]
-    test_res_multi = test_residuals[0]
-    
-    for i in range(1, len(train_residuals)):
-        train_res_multi = train_res_multi.stack(train_residuals[i])
-        test_res_multi = test_res_multi.stack(test_residuals[i])
+    # Prepare Trends for SVR (Multivariate)
+    try:
+        train_trend_multi, test_trend_multi = prep.prepare_multivariate_series(
+            components, 
+            train_df.index, 
+            test_df.index,
+            col_name='trend'
+        )
+    except ValueError as e:
+        logger.error(str(e))
+        return
         
-    # Hyperparameter Tuning for VARIMA
-    logger.info("Starting Hyperparameter Tuning for VARIMA...")
-    best_model = None
-    best_aic = float('inf')
+    # Hyperparameter Tuning for Linear Regression (Trend)
+    logger.info("Starting Hyperparameter Tuning for Linear Regression (Trend)...")
     
-    # Simple grid search for p, d, q
-    ps = [1, 2, 3]
-    ds = [0, 1]
-    qs = [0, 1, 2]
+    parameters = {
+        'lags': [4, 8, 12, 26, 52]
+    }
     
-    for p in ps:
-        for d in ds:
-            for q in qs:
-                try:
-                    logger.info(f"Trying VARIMA(p={p},d={d},q={q})...")
-                    model = VARIMA(p=p, d=d, q=q, trend='c')
-                    
-                    # Validate on last 12 weeks of train
-                    val_len = 12
-                    train_sub, val_sub = train_res_multi[:-val_len], train_res_multi[-val_len:]
-                    model.fit(train_sub)
-                    pred = model.predict(n=val_len)
-                    err = mse(val_sub, pred)
-                    
-                    if err < best_aic:
-                        best_aic = err
-                        best_model = VARIMA(p=p, d=d, q=q, trend='c')
-                        logger.info(f"New best VARIMA(p={p},d={d},q={q}) with AIC={err:.4f}")
-                        
-                except Exception as e:
-                    logger.warning(f"VARIMA(p={p},d={d},q={q}) failed: {str(e)}")
-                    continue
-    
-    if best_model is None:
-        logger.warning("Hyperparameter tuning failed, using default VARIMA(1,0,0)")
-        best_model = VARIMA(p=1, d=0, q=0)
+    try:
+        best_model, best_params, best_score = ModelTraining.perform_grid_search(
+            LinearRegressionModel, parameters, train_trend_multi
+        )
+        logger.info(f"Best Linear Regression parameters: {best_params} with MSE={best_score}")
+        
+    except Exception as e:
+        logger.warning(f"Grid search failed: {str(e)}. Using default LinearRegressionModel(lags=4)")
+        best_model = LinearRegressionModel(lags=4)
         
     # Fit best model on full train residuals
-    logger.info("Fitting best VARIMA model on full train residuals...")
+    best_model.fit(train_trend_multi)
+    
+    # Historical Forecasts (on Test set)
+    full_trend_multi = train_trend_multi.append(test_trend_multi)
+    
+    hist_pred_trend = best_model.historical_forecasts(
+        series=full_trend_multi,
+        start=len(train_trend_multi),
+        forecast_horizon=1,
+        stride=1,
+        retrain=False,
+        verbose=True
+    )
+    
+    # Prepare Residuals for VARIMA (Multivariate)
+    try:
+        train_res_multi, test_res_multi = prep.prepare_multivariate_series(
+            components, 
+            train_df.index, 
+            test_df.index,
+            col_name='residual'
+        )
+    except ValueError as e:
+        logger.error(str(e))
+        return
+        
+    # Hyperparameter Tuning for VARIMA
+    parameters = {
+        'p': [1, 2, 3],
+        'd': [0, 1],
+        'q': [0, 1, 2],
+        'trend': ['c']
+    }
+    
+    try:
+        best_model, best_params, best_score = ModelTraining.perform_grid_search(
+            VARIMA, parameters, train_res_multi
+        )
+        logger.info(f"Best VARIMA parameters: {best_params} with MSE={best_score}")
+        
+    except Exception as e:
+        logger.warning(f"Grid search failed: {str(e)}. Using default VARIMA(1,0,0)")
+        best_model = VARIMA(p=1, d=0, q=0, trend='None')
+        
+    # Fit best model on full train residuals
     best_model.fit(train_res_multi)
     
     # Historical Forecasts (on Test set)
-    logger.info("Generating historical forecasts...")
-    
-    # Append test data for historical forecasts
     full_res_multi = train_res_multi.append(test_res_multi)
     
     hist_pred_res = best_model.historical_forecasts(
         series=full_res_multi,
-        start=pd.Timestamp("2021-02-05"), #len(train_res_multi),
+        start=len(train_res_multi),
         forecast_horizon=1,
         stride=1,
         retrain=False,
@@ -346,59 +449,25 @@ def run_varima_pipeline():
         if target not in components:
             continue
             
-        comp = components[target]
-        train_idx = comp.index.intersection(train_df.index)
-        test_idx = comp.index.intersection(test_df.index)
-        
-        train_comp = comp.loc[train_idx]
-        test_comp = comp.loc[test_idx]
-        
-        # 1. Forecast Trend (Linear Regression)
-        trend_train = TimeSeries.from_series(train_comp['trend'])
-        trend_model = LinearRegressionModel(lags=4)
-        trend_model.fit(trend_train)
-        
-        full_trend = TimeSeries.from_series(comp['trend'])
-        trend_pred = trend_model.historical_forecasts(
-            series=full_trend,
-            start=pd.Timestamp("2021-02-05"),
-            forecast_horizon=1,
-            stride=1,
-            retrain=True
-        )
-        
-        # 2. Forecast Seasonal (NaiveSeasonal)
-        seasonal_train = TimeSeries.from_series(train_comp['seasonal'])
-        seasonal_model = NaiveSeasonal(K=SEASONAL_PERIOD)
-        seasonal_model.fit(seasonal_train)
-        
-        full_seasonal = TimeSeries.from_series(comp['seasonal'])
-        seasonal_pred = seasonal_model.historical_forecasts(
-            series=full_seasonal,
-            start=pd.Timestamp("2021-02-05"),
-            forecast_horizon=1,
-            stride=1,
-            retrain=True
-        )
-        
-        # 3. Get Residual Prediction
+        # 1. Component Predictions
+        trend_pred = hist_pred_trend.univariate_component(i)
         res_pred = hist_pred_res.univariate_component(i)
         
-        # Align indices
-        common_index = trend_pred.time_index.intersection(seasonal_pred.time_index).intersection(res_pred.time_index)
+        seasonal_pred = ModelTraining.forecast_seasonal(
+            series=components[target]['seasonal'],
+            train_split_date=train_df.index[-1],
+            period=SEASONAL_PERIOD
+        )
         
-        trend_vals = trend_pred.slice(common_index[0], common_index[-1]).values().flatten()
-        seasonal_vals = seasonal_pred.slice(common_index[0], common_index[-1]).values().flatten()
-        res_vals = res_pred.slice(common_index[0], common_index[-1]).values().flatten()
-        
-        final_pred_vals = trend_vals + seasonal_vals + res_vals
-        final_pred_series = pd.Series(final_pred_vals, index=common_index)
-        
+        # 2. Reconstruct Prediction
+        final_pred_series = ModelTraining.combine_predictions([trend_pred, seasonal_pred, res_pred])
+        common_index = final_pred_series.time_index
+
         # Get Actuals
         actuals = full_df.loc[common_index, target]
         
         # Evaluate
-        metrics = Evaluator.calculate_metrics(actuals.values, final_pred_vals)
+        metrics = Evaluator.calculate_metrics(actuals.values, final_pred_series.values())
         logger.info(f"Results for {target}: {metrics}")
         
         # Save metrics
@@ -406,7 +475,8 @@ def run_varima_pipeline():
             json.dump(metrics, f, indent=4)
             
         # Plot
-        Visualization.plot_forecast(actuals, final_pred_series, target, OUTPUT_DIR)
+        preds = pd.Series(final_pred_series.values().flatten(), index=final_pred_series.time_index)
+        Visualization.plot_forecast(actuals, preds, target, OUTPUT_DIR)
         
     logger.info("Pipeline completed successfully.")
 
