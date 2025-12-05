@@ -1,13 +1,15 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 from typing import Dict, Tuple, Any, Optional, List, Union
 import logging
 import warnings
 import shutil
-import sys
+import json
+
+# Standard imports
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Darts imports
 from darts import TimeSeries
@@ -48,50 +50,23 @@ class DataIngestion:
     def load_and_resample(self) -> pd.DataFrame:
         """Load all data sources and resample to weekly frequency (W-FRI)."""
         logger.info("Loading and resampling data...")
-        dfs = {}
-        csv_files = list(self.source_dir.glob('*.csv'))
         
-        if not csv_files:
-            raise ValueError(f"No CSV files found in {self.source_dir}")
-            
-        for file_path in csv_files:
-            try:
-                # Load CSV
-                df = pd.read_csv(file_path, parse_dates=True, index_col=0)
-                
-                # Resample based on filename pattern
-                if 'Daily' in file_path.name:
-                    df_resampled = df.resample('W-FRI').agg(['mean', 'max', 'min', 'last'])
-                    df_resampled.columns = ['_'.join(col) for col in df_resampled.columns]
-                elif 'Weekly' in file_path.name:
-                    df_resampled = df.resample('W-FRI').last()
-                elif 'Monthly' in file_path.name or 'Quarterly' in file_path.name:
-                    offset = pd.offsets.MonthEnd(0) if 'Monthly' in file_path.name else pd.offsets.QuarterEnd(0)
-                    df.index = df.index + offset
-                    limit = 5 if 'Monthly' in file_path.name else 14
-                    df_resampled = df.resample('W-FRI').mean().interpolate(method='linear', limit=limit)
-                elif 'Yearly' in file_path.name:
-                    df.index = df.index + pd.offsets.YearEnd(0)
-                    df_resampled = df.resample('W-FRI').ffill(limit=53)
-                else:
-                    df_resampled = df.resample('W-FRI').mean()
+        # Load CSV
+        try:
+            df = pd.read_csv(self.source_dir, parse_dates=True, index_col=0)
+        except Exception as e:
+            logger.error(f"Error processing {self.source_dir}: {str(e)}")
+            raise
 
-                # Rename columns
-                df_resampled.columns = [f"({file_path.name}){col}" for col in df_resampled.columns]
-                dfs[file_path.name] = df_resampled
-                
-            except Exception as e:
-                logger.error(f"Error processing {file_path.name}: {str(e)}")
-                raise
+        # Resample to weekly frequency (W-FRI)
+        df_resampled = df.resample('W-FRI').agg(['mean', 'max', 'min', 'last'])
+        df_resampled.columns = ['_'.join(col) for col in df_resampled.columns]
 
-        # Merge dataframes
-        merged_df = pd.concat(dfs.values(), axis=1)
-        
         # Filter by date range
         if self.date_range:
-            merged_df = merged_df.loc[self.date_range[0]:self.date_range[1]]
+            df_resampled = df_resampled.loc[self.date_range[0]:self.date_range[1]]
             
-        return merged_df
+        return df_resampled
 
     def clean(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean dataframe by dropping constant columns and filling specific NaNs."""
@@ -316,9 +291,9 @@ def run_varima_pipeline():
     best_aic = float('inf')
     
     # Simple grid search for p, d, q
-    ps = [1, 2]
+    ps = [1, 2, 3]
     ds = [0, 1]
-    qs = [0, 1]
+    qs = [0, 1, 2]
     
     for p in ps:
         for d in ds:
@@ -337,7 +312,7 @@ def run_varima_pipeline():
                     if err < best_aic:
                         best_aic = err
                         best_model = VARIMA(p=p, d=d, q=q, trend='c')
-                        logger.info(f"New best VARIMA(p={p},d={d},q={q}) with MSE={err:.4f}")
+                        logger.info(f"New best VARIMA(p={p},d={d},q={q}) with AIC={err:.4f}")
                         
                 except Exception as e:
                     logger.warning(f"VARIMA(p={p},d={d},q={q}) failed: {str(e)}")
@@ -359,7 +334,7 @@ def run_varima_pipeline():
     
     hist_pred_res = best_model.historical_forecasts(
         series=full_res_multi,
-        start=len(train_res_multi),
+        start=pd.Timestamp("2021-02-05"), #len(train_res_multi),
         forecast_horizon=1,
         stride=1,
         retrain=False,
@@ -386,7 +361,7 @@ def run_varima_pipeline():
         full_trend = TimeSeries.from_series(comp['trend'])
         trend_pred = trend_model.historical_forecasts(
             series=full_trend,
-            start=pd.Timestamp("2022-02-04"),
+            start=pd.Timestamp("2021-02-05"),
             forecast_horizon=1,
             stride=1,
             retrain=True
@@ -400,7 +375,7 @@ def run_varima_pipeline():
         full_seasonal = TimeSeries.from_series(comp['seasonal'])
         seasonal_pred = seasonal_model.historical_forecasts(
             series=full_seasonal,
-            start=pd.Timestamp("2022-02-04"),
+            start=pd.Timestamp("2021-02-05"),
             forecast_horizon=1,
             stride=1,
             retrain=True
@@ -420,15 +395,15 @@ def run_varima_pipeline():
         final_pred_series = pd.Series(final_pred_vals, index=common_index)
         
         # Get Actuals
-        actuals = test_df.loc[common_index, target]
+        actuals = full_df.loc[common_index, target]
         
         # Evaluate
         metrics = Evaluator.calculate_metrics(actuals.values, final_pred_vals)
         logger.info(f"Results for {target}: {metrics}")
         
         # Save metrics
-        with open(OUTPUT_DIR / f"{target}_metrics.txt", "w") as f:
-            f.write(str(metrics))
+        with open(OUTPUT_DIR / f"{target}_metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=4)
             
         # Plot
         Visualization.plot_forecast(actuals, final_pred_series, target, OUTPUT_DIR)
