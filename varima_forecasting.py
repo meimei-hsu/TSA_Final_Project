@@ -184,7 +184,9 @@ class ModelTraining:
         model_entity, 
         parameters: Dict[str, Any], 
         series: TimeSeries, 
-        metric=mse,
+        past_covariates: Optional[TimeSeries] = None,
+        future_covariates: Optional[TimeSeries] = None,
+        metric=smape,
         val_len: int = 12
     ) -> Tuple[Any, Dict[str, Any], float]:
         """
@@ -196,6 +198,8 @@ class ModelTraining:
         return model_entity.gridsearch(
             parameters=parameters,
             series=train,
+            past_covariates=past_covariates,
+            future_covariates=future_covariates,
             val_series=val,
             metric=metric
         )
@@ -423,8 +427,19 @@ def run_varima_pipeline():
 
     # Differencing
     diff_trasformer = Diff()
-    train_res_multi = diff_trasformer.fit_transform(train_res_multi)
-    full_res_multi = diff_trasformer.transform(full_res_multi)
+    train_res_cov = diff_trasformer.fit_transform(train_res_multi)
+    full_res_cov = diff_trasformer.transform(full_res_multi)
+
+    missing_filler = MissingValuesFiller(fill=0.0)
+    train_res_future_cov = missing_filler.transform(train_res_cov.shift(1))
+    full_res_future_cov = missing_filler.transform(full_res_cov.shift(1))
+
+    # Align target and covariates to intersection (fixes start date mismatch due to shift/diff)
+    train_res_multi = train_res_multi.slice_intersect(train_res_future_cov)
+    train_res_future_cov = train_res_future_cov.slice_intersect(train_res_multi)
+    
+    full_res_multi = full_res_multi.slice_intersect(full_res_future_cov)
+    full_res_future_cov = full_res_future_cov.slice_intersect(full_res_multi)
         
     # Hyperparameter Tuning for VARIMA
     parameters = {
@@ -436,7 +451,7 @@ def run_varima_pipeline():
     
     try:
         best_model, best_params, best_score = ModelTraining.perform_grid_search(
-            VARIMA, parameters, train_res_multi
+            VARIMA, parameters, train_res_multi, future_covariates=train_res_future_cov
         )
         logger.info(f"Best VARIMA parameters: {best_params} with MSE={best_score}")
         
@@ -445,11 +460,12 @@ def run_varima_pipeline():
         best_model = VARIMA(p=1, d=0, q=0, trend='n')
         
     # Fit best model on full train residuals
-    best_model.fit(train_res_multi)
+    best_model.fit(train_res_multi, future_covariates=train_res_future_cov)
     
     # Historical Forecasts (on Test set)
     hist_pred_res = best_model.historical_forecasts(
         series=full_res_multi,
+        future_covariates=full_res_future_cov,
         start=len(train_res_multi),
         forecast_horizon=1,
         stride=1,
@@ -457,11 +473,6 @@ def run_varima_pipeline():
         verbose=True
     )
 
-    # Inverse differencing
-    combined_diff = train_res_multi.append(hist_pred_res)
-    combined_inv = diff_trasformer.inverse_transform(combined_diff)
-    hist_pred_res = combined_inv.slice(hist_pred_res.start_time(), hist_pred_res.end_time())
-    
     # Reconstruct predictions
     for i, target in enumerate(targets):
         if target not in components:
