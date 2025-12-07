@@ -430,13 +430,6 @@ def run_varima_pipeline():
     train_res_cov = diff_trasformer.fit_transform(train_res_multi)
     full_res_cov = diff_trasformer.transform(full_res_multi)
 
-    # Add other exogenous variables
-    train_exog_multi = TimeSeries.from_dataframe(train_df.drop(columns=targets)).slice_intersect(train_res_cov)
-    full_exog_multi = TimeSeries.from_dataframe(full_df.drop(columns=targets)).slice_intersect(full_res_cov)
-    
-    train_res_cov = train_res_cov.concatenate(train_exog_multi, axis=1)
-    full_res_cov = full_res_cov.concatenate(full_exog_multi, axis=1)
-
     # Fill missing values
     missing_filler = MissingValuesFiller(fill=0.0)
     train_res_future_cov = missing_filler.transform(train_res_cov.shift(1))
