@@ -15,7 +15,7 @@ import seaborn as sns
 from darts import TimeSeries
 from darts.models import VARIMA, Theta, NaiveSeasonal
 from darts.metrics import smape, mase, mae, mse, rmse
-from darts.dataprocessing.transformers import Scaler, MissingValuesFiller
+from darts.dataprocessing.transformers import Scaler, Diff, MissingValuesFiller
 from darts.utils.statistics import check_seasonality
 from darts.utils.utils import SeasonalityMode
 
@@ -398,7 +398,7 @@ def run_varima_pipeline():
     # 2. Data Preparation
     prep = DataPreparation(targets)
     train_df, test_df = prep.impute_missing(train_df, test_df)
-    
+
     # Decompose (on combined data to ensure continuity, then split)
     full_df = pd.concat([train_df, test_df])
     components = prep.decompose(full_df, period=SEASONAL_PERIOD)
@@ -416,16 +416,22 @@ def run_varima_pipeline():
             test_df.index,
             col_name='residual'
         )
+        full_res_multi = train_res_multi.append(test_res_multi)
     except ValueError as e:
         logger.error(str(e))
         return
+
+    # Differencing
+    diff_trasformer = Diff()
+    train_res_multi = diff_trasformer.fit_transform(train_res_multi)
+    full_res_multi = diff_trasformer.transform(full_res_multi)
         
     # Hyperparameter Tuning for VARIMA
     parameters = {
         'p': [1, 2, 3],
-        'd': [0, 1],
+        'd': [0],
         'q': [0, 1, 2],
-        'trend': ['n']
+        'trend': ['n', 'c']
     }
     
     try:
@@ -442,8 +448,6 @@ def run_varima_pipeline():
     best_model.fit(train_res_multi)
     
     # Historical Forecasts (on Test set)
-    full_res_multi = train_res_multi.append(test_res_multi)
-    
     hist_pred_res = best_model.historical_forecasts(
         series=full_res_multi,
         start=len(train_res_multi),
@@ -452,6 +456,11 @@ def run_varima_pipeline():
         retrain=False,
         verbose=True
     )
+
+    # Inverse differencing
+    combined_diff = train_res_multi.append(hist_pred_res)
+    combined_inv = diff_trasformer.inverse_transform(combined_diff)
+    hist_pred_res = combined_inv.slice(hist_pred_res.start_time(), hist_pred_res.end_time())
     
     # Reconstruct predictions
     for i, target in enumerate(targets):
