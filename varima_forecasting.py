@@ -1,20 +1,23 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 from typing import Dict, Tuple, Any, Optional, List, Union
 import logging
 import warnings
 import shutil
-import sys
+import json
+
+# Standard imports
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Darts imports
 from darts import TimeSeries
-from darts.models import VARIMA, LinearRegressionModel, NaiveSeasonal
+from darts.models import VARIMA, Theta, NaiveSeasonal
 from darts.metrics import smape, mase, mae, mse, rmse
-from darts.dataprocessing.transformers import Scaler, MissingValuesFiller
+from darts.dataprocessing.transformers import Scaler, Diff, MissingValuesFiller
 from darts.utils.statistics import check_seasonality
+from darts.utils.utils import SeasonalityMode
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -48,50 +51,23 @@ class DataIngestion:
     def load_and_resample(self) -> pd.DataFrame:
         """Load all data sources and resample to weekly frequency (W-FRI)."""
         logger.info("Loading and resampling data...")
-        dfs = {}
-        csv_files = list(self.source_dir.glob('*.csv'))
         
-        if not csv_files:
-            raise ValueError(f"No CSV files found in {self.source_dir}")
-            
-        for file_path in csv_files:
-            try:
-                # Load CSV
-                df = pd.read_csv(file_path, parse_dates=True, index_col=0)
-                
-                # Resample based on filename pattern
-                if 'Daily' in file_path.name:
-                    df_resampled = df.resample('W-FRI').agg(['mean', 'max', 'min', 'last'])
-                    df_resampled.columns = ['_'.join(col) for col in df_resampled.columns]
-                elif 'Weekly' in file_path.name:
-                    df_resampled = df.resample('W-FRI').last()
-                elif 'Monthly' in file_path.name or 'Quarterly' in file_path.name:
-                    offset = pd.offsets.MonthEnd(0) if 'Monthly' in file_path.name else pd.offsets.QuarterEnd(0)
-                    df.index = df.index + offset
-                    limit = 5 if 'Monthly' in file_path.name else 14
-                    df_resampled = df.resample('W-FRI').mean().interpolate(method='linear', limit=limit)
-                elif 'Yearly' in file_path.name:
-                    df.index = df.index + pd.offsets.YearEnd(0)
-                    df_resampled = df.resample('W-FRI').ffill(limit=53)
-                else:
-                    df_resampled = df.resample('W-FRI').mean()
+        # Load CSV
+        try:
+            df = pd.read_csv(self.source_dir, parse_dates=True, index_col=0)
+        except Exception as e:
+            logger.error(f"Error processing {self.source_dir}: {str(e)}")
+            raise
 
-                # Rename columns
-                df_resampled.columns = [f"({file_path.name}){col}" for col in df_resampled.columns]
-                dfs[file_path.name] = df_resampled
-                
-            except Exception as e:
-                logger.error(f"Error processing {file_path.name}: {str(e)}")
-                raise
+        # Resample to weekly frequency (W-FRI)
+        df_resampled = df.resample('W-FRI').agg(['mean', 'max', 'min', 'last'])
+        df_resampled.columns = ['_'.join(col) for col in df_resampled.columns]
 
-        # Merge dataframes
-        merged_df = pd.concat(dfs.values(), axis=1)
-        
         # Filter by date range
         if self.date_range:
-            merged_df = merged_df.loc[self.date_range[0]:self.date_range[1]]
+            df_resampled = df_resampled.loc[self.date_range[0]:self.date_range[1]]
             
-        return merged_df
+        return df_resampled
 
     def clean(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean dataframe by dropping constant columns and filling specific NaNs."""
@@ -171,6 +147,134 @@ class DataPreparation:
             
         return components
 
+    def prepare_multivariate_series(self, data: Dict[str, pd.DataFrame], train_index: pd.Index, 
+                                    test_index: pd.Index, col_name: str) -> Tuple[TimeSeries, TimeSeries]:
+        """
+        Prepare multivariate TimeSeries from a dictionary of DataFrames.
+        """
+        # Collect relevant series
+        series_list = []
+        for target in self.target_cols:
+            if target in data and col_name in data[target].columns:
+                series_list.append(data[target][col_name].rename(target))
+        
+        if not series_list:
+            raise ValueError(f"No valid data found for column '{col_name}'")
+            
+        # Create unified DataFrame (inner join for alignment)
+        multi_df = pd.concat(series_list, axis=1, join='inner')
+        
+        # Split based on provided indices
+        train_df = multi_df.loc[multi_df.index.isin(train_index)]
+        test_df = multi_df.loc[multi_df.index.isin(test_index)]
+        
+        if train_df.empty:
+            raise ValueError("Training set is empty after alignment")
+            
+        # Convert to Darts TimeSeries
+        return TimeSeries.from_dataframe(train_df), TimeSeries.from_dataframe(test_df)
+
+
+class ModelTraining:
+    """
+    Handles model training and hyperparameter tuning.
+    """
+    @staticmethod
+    def perform_grid_search(
+        model_entity, 
+        parameters: Dict[str, Any], 
+        series: TimeSeries, 
+        past_covariates: Optional[TimeSeries] = None,
+        future_covariates: Optional[TimeSeries] = None,
+        metric=smape,
+        val_len: int = 12
+    ) -> Tuple[Any, Dict[str, Any], float]:
+        """
+        Perform grid search with validation on the last `val_len` points of `series`.
+        """
+        train = series[:-val_len]
+        val = series[-val_len:]
+        
+        return model_entity.gridsearch(
+            parameters=parameters,
+            series=train,
+            past_covariates=past_covariates,
+            future_covariates=future_covariates,
+            val_series=val,
+            metric=metric
+        )
+
+    @staticmethod
+    def forecast_trend(
+        series: pd.Series, 
+        train_split_date: Any
+    ) -> TimeSeries:
+        """
+        Fits a Theta model to extrapolate the trend. 
+        """
+        full_trend_ts = TimeSeries.from_series(series)
+        train_trend_ts = full_trend_ts.drop_after(train_split_date)
+        
+        # Theta(2) is equivalent to linear extrapolation
+        model = Theta(theta=2, season_mode=SeasonalityMode.NONE) 
+        
+        return model.historical_forecasts(
+            series=full_trend_ts,
+            start=len(train_trend_ts),
+            forecast_horizon=1,
+            stride=1,
+            retrain=True,
+            verbose=False
+        )
+
+    @staticmethod
+    def forecast_seasonal(
+        series: pd.Series, 
+        train_split_date: Any, 
+        period: int
+    ) -> TimeSeries:
+        """
+        Forecast seasonal component using NaiveSeasonal.
+        """
+        full_seasonal_ts = TimeSeries.from_series(series)
+        train_seasonal_ts = full_seasonal_ts.drop_after(train_split_date)
+        
+        seasonal_model = NaiveSeasonal(K=period)
+        seasonal_model.fit(train_seasonal_ts)
+        
+        return seasonal_model.historical_forecasts(
+            series=full_seasonal_ts,
+            start=len(train_seasonal_ts),
+            forecast_horizon=1,
+            stride=1,
+            retrain=True,
+            verbose=False
+        )
+
+    @staticmethod
+    def combine_predictions(predictions: List[TimeSeries]) -> TimeSeries:
+        """
+        Align multiple TimeSeries on their common time index and sum them up.
+        """
+        if not predictions:
+            raise ValueError("No predictions provided")
+            
+        # Find common intersection
+        common_index = predictions[0].time_index
+        for ts in predictions[1:]:
+            common_index = common_index.intersection(ts.time_index)
+            
+        if common_index.empty:
+            raise ValueError("No overlapping time index found")
+            
+        # Sum values on common index
+        final_values = sum(
+            ts.slice(common_index[0], common_index[-1]).values().flatten() 
+            for ts in predictions
+        )
+            
+        return TimeSeries.from_times_and_values(common_index, final_values)
+
 
 class Evaluator:
     """
@@ -226,14 +330,43 @@ class Visualization:
             plt.close()
 
     @staticmethod
-    def plot_forecast(y_true: pd.Series, y_pred: pd.Series, target_name: str, output_dir: Path):
-        """Plot actual vs forecast."""
-        plt.figure(figsize=(12, 6))
-        plt.plot(y_true.index, y_true.values, label='Actual')
-        plt.plot(y_pred.index, y_pred.values, label='Forecast', color='red')
-        plt.title(f'Forecast vs Actual: {target_name}')
-        plt.legend()
-        plt.savefig(output_dir / f"{target_name}_forecast.png")
+    def plot_forecast_components(
+        target_name: str,
+        y_true: pd.Series,
+        y_pred: pd.Series,
+        actual_components: pd.DataFrame,
+        pred_components: Dict[str, pd.Series],
+        output_dir: Path
+    ):
+        """Plot Actual vs Forecast for Total and Components."""
+        fig, axes = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
+        
+        # Total
+        axes[0].plot(y_true.index, y_true.values, label='Actual', color='black')
+        axes[0].plot(y_pred.index, y_pred.values, label='Forecast', color='red', linestyle='--')
+        axes[0].set_title(f'{target_name} - Total')
+        axes[0].legend()
+        
+        # Trend
+        axes[1].plot(actual_components.index, actual_components['trend'].values, label='Actual Trend')
+        axes[1].plot(pred_components['trend'].index, pred_components['trend'].values, label='Forecast Trend', color='red', linestyle='--')
+        axes[1].set_title(f'{target_name} - Trend')
+        axes[1].legend()
+
+        # Seasonal
+        axes[2].plot(actual_components.index, actual_components['seasonal'].values, label='Actual Seasonal')
+        axes[2].plot(pred_components['seasonal'].index, pred_components['seasonal'].values, label='Forecast Seasonal', color='red', linestyle='--')
+        axes[2].set_title(f'{target_name} - Seasonal')
+        axes[2].legend()
+
+        # Residual
+        axes[3].plot(actual_components.index, actual_components['residual'].values, label='Actual Residual')
+        axes[3].plot(pred_components['residual'].index, pred_components['residual'].values, label='Forecast Residual', color='red', linestyle='--')
+        axes[3].set_title(f'{target_name} - Residual')
+        axes[3].legend()
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / f"{target_name}_forecast_components.png")
         plt.close()
 
 
@@ -269,7 +402,7 @@ def run_varima_pipeline():
     # 2. Data Preparation
     prep = DataPreparation(targets)
     train_df, test_df = prep.impute_missing(train_df, test_df)
-    
+
     # Decompose (on combined data to ensure continuity, then split)
     full_df = pd.concat([train_df, test_df])
     components = prep.decompose(full_df, period=SEASONAL_PERIOD)
@@ -280,158 +413,119 @@ def run_varima_pipeline():
     # 3. Modeling & Forecasting
     
     # Prepare Residuals for VARIMA (Multivariate)
-    train_residuals = []
-    test_residuals = []
-    
-    for target in targets:
-        if target not in components:
-            continue
-        
-        comp = components[target]
-        # Split components back to train/test (align indices)
-        train_idx = comp.index.intersection(train_df.index)
-        test_idx = comp.index.intersection(test_df.index)
-        
-        train_comp = comp.loc[train_idx]
-        test_comp = comp.loc[test_idx]
-        
-        train_residuals.append(TimeSeries.from_series(train_comp['residual']))
-        test_residuals.append(TimeSeries.from_series(test_comp['residual']))
-    
-    if not train_residuals:
-        logger.error("No targets found for modeling")
+    try:
+        train_res_multi, test_res_multi = prep.prepare_multivariate_series(
+            components, 
+            train_df.index, 
+            test_df.index,
+            col_name='residual'
+        )
+        full_res_multi = train_res_multi.append(test_res_multi)
+    except ValueError as e:
+        logger.error(str(e))
         return
 
-    # Create multivariate series
-    train_res_multi = train_residuals[0]
-    test_res_multi = test_residuals[0]
+    # Differencing
+    diff_trasformer = Diff(lags=1)
+    train_res_cov = diff_trasformer.fit_transform(train_res_multi)
+    full_res_cov = diff_trasformer.transform(full_res_multi)
+
+    # Add other exogenous variables
+    train_exog_multi = TimeSeries.from_dataframe(train_df.drop(columns=targets)).slice_intersect(train_res_cov)
+    full_exog_multi = TimeSeries.from_dataframe(full_df.drop(columns=targets)).slice_intersect(full_res_cov)
     
-    for i in range(1, len(train_residuals)):
-        train_res_multi = train_res_multi.stack(train_residuals[i])
-        test_res_multi = test_res_multi.stack(test_residuals[i])
+    train_res_cov = train_res_cov.concatenate(train_exog_multi, axis=1)
+    full_res_cov = full_res_cov.concatenate(full_exog_multi, axis=1)
+
+    # Fill missing values
+    missing_filler = MissingValuesFiller(fill=0.0)
+    train_res_future_cov = missing_filler.transform(train_res_cov.shift(1))
+    full_res_future_cov = missing_filler.transform(full_res_cov.shift(1))
+
+    # Align target and covariates to intersection (fixes start date mismatch due to shift/diff)
+    train_res_multi = train_res_multi.slice_intersect(train_res_future_cov)
+    train_res_future_cov = train_res_future_cov.slice_intersect(train_res_multi)
+    
+    full_res_multi = full_res_multi.slice_intersect(full_res_future_cov)
+    full_res_future_cov = full_res_future_cov.slice_intersect(full_res_multi)
         
     # Hyperparameter Tuning for VARIMA
-    logger.info("Starting Hyperparameter Tuning for VARIMA...")
-    best_model = None
-    best_aic = float('inf')
+    parameters = {
+        'p': [1, 2, 3],
+        'd': [0],
+        'q': [0, 1, 2],
+        'trend': ['n', 'c']
+    }
     
-    # Simple grid search for p, d, q
-    ps = [1, 2]
-    ds = [0, 1]
-    qs = [0, 1]
-    
-    for p in ps:
-        for d in ds:
-            for q in qs:
-                try:
-                    logger.info(f"Trying VARIMA(p={p},d={d},q={q})...")
-                    model = VARIMA(p=p, d=d, q=q, trend='c')
-                    
-                    # Validate on last 12 weeks of train
-                    val_len = 12
-                    train_sub, val_sub = train_res_multi[:-val_len], train_res_multi[-val_len:]
-                    model.fit(train_sub)
-                    pred = model.predict(n=val_len)
-                    err = mse(val_sub, pred)
-                    
-                    if err < best_aic:
-                        best_aic = err
-                        best_model = VARIMA(p=p, d=d, q=q, trend='c')
-                        logger.info(f"New best VARIMA(p={p},d={d},q={q}) with MSE={err:.4f}")
-                        
-                except Exception as e:
-                    logger.warning(f"VARIMA(p={p},d={d},q={q}) failed: {str(e)}")
-                    continue
-    
-    if best_model is None:
-        logger.warning("Hyperparameter tuning failed, using default VARIMA(1,0,0)")
-        best_model = VARIMA(p=1, d=0, q=0)
+    try:
+        best_model, best_params, best_score = ModelTraining.perform_grid_search(
+            VARIMA, parameters, train_res_multi, future_covariates=train_res_future_cov
+        )
+        logger.info(f"Best VARIMA parameters: {best_params} with MSE={best_score}")
+        
+    except Exception as e:
+        logger.warning(f"Grid search failed: {str(e)}. Using default VARIMA(1,0,0)")
+        best_model = VARIMA(p=1, d=0, q=0, trend='n')
         
     # Fit best model on full train residuals
-    logger.info("Fitting best VARIMA model on full train residuals...")
-    best_model.fit(train_res_multi)
+    best_model.fit(train_res_multi, future_covariates=train_res_future_cov)
     
     # Historical Forecasts (on Test set)
-    logger.info("Generating historical forecasts...")
-    
-    # Append test data for historical forecasts
-    full_res_multi = train_res_multi.append(test_res_multi)
-    
     hist_pred_res = best_model.historical_forecasts(
         series=full_res_multi,
+        future_covariates=full_res_future_cov,
         start=len(train_res_multi),
         forecast_horizon=1,
         stride=1,
         retrain=False,
         verbose=True
     )
-    
+
     # Reconstruct predictions
     for i, target in enumerate(targets):
         if target not in components:
             continue
             
-        comp = components[target]
-        train_idx = comp.index.intersection(train_df.index)
-        test_idx = comp.index.intersection(test_df.index)
-        
-        train_comp = comp.loc[train_idx]
-        test_comp = comp.loc[test_idx]
-        
-        # 1. Forecast Trend (Linear Regression)
-        trend_train = TimeSeries.from_series(train_comp['trend'])
-        trend_model = LinearRegressionModel(lags=4)
-        trend_model.fit(trend_train)
-        
-        full_trend = TimeSeries.from_series(comp['trend'])
-        trend_pred = trend_model.historical_forecasts(
-            series=full_trend,
-            start=pd.Timestamp("2022-02-04"),
-            forecast_horizon=1,
-            stride=1,
-            retrain=True
-        )
-        
-        # 2. Forecast Seasonal (NaiveSeasonal)
-        seasonal_train = TimeSeries.from_series(train_comp['seasonal'])
-        seasonal_model = NaiveSeasonal(K=SEASONAL_PERIOD)
-        seasonal_model.fit(seasonal_train)
-        
-        full_seasonal = TimeSeries.from_series(comp['seasonal'])
-        seasonal_pred = seasonal_model.historical_forecasts(
-            series=full_seasonal,
-            start=pd.Timestamp("2022-02-04"),
-            forecast_horizon=1,
-            stride=1,
-            retrain=True
-        )
-        
-        # 3. Get Residual Prediction
+        # 1. Component Predictions
         res_pred = hist_pred_res.univariate_component(i)
+
+        trend_pred = ModelTraining.forecast_trend(
+            series=components[target]['trend'],
+            train_split_date=train_df.index[-1]
+        )
         
-        # Align indices
-        common_index = trend_pred.time_index.intersection(seasonal_pred.time_index).intersection(res_pred.time_index)
+        seasonal_pred = ModelTraining.forecast_seasonal(
+            series=components[target]['seasonal'],
+            train_split_date=train_df.index[-1],
+            period=SEASONAL_PERIOD
+        )
         
-        trend_vals = trend_pred.slice(common_index[0], common_index[-1]).values().flatten()
-        seasonal_vals = seasonal_pred.slice(common_index[0], common_index[-1]).values().flatten()
-        res_vals = res_pred.slice(common_index[0], common_index[-1]).values().flatten()
-        
-        final_pred_vals = trend_vals + seasonal_vals + res_vals
-        final_pred_series = pd.Series(final_pred_vals, index=common_index)
-        
+        # 2. Reconstruct Prediction
+        final_pred_series = ModelTraining.combine_predictions([trend_pred, seasonal_pred, res_pred])
+        common_index = final_pred_series.time_index
+
         # Get Actuals
-        actuals = test_df.loc[common_index, target]
+        actuals = full_df.loc[common_index, target]
         
         # Evaluate
-        metrics = Evaluator.calculate_metrics(actuals.values, final_pred_vals)
+        metrics = Evaluator.calculate_metrics(actuals.values, final_pred_series.values())
         logger.info(f"Results for {target}: {metrics}")
         
         # Save metrics
-        with open(OUTPUT_DIR / f"{target}_metrics.txt", "w") as f:
-            f.write(str(metrics))
+        with open(OUTPUT_DIR / f"{target}_metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=4)
             
         # Plot
-        Visualization.plot_forecast(actuals, final_pred_series, target, OUTPUT_DIR)
+        preds = pd.Series(final_pred_series.values().flatten(), index=common_index)
+        
+        act_comps = components[target].loc[common_index]
+        pred_comps = {
+            'trend': pd.Series(trend_pred.values().flatten(), index=trend_pred.time_index),
+            'seasonal': pd.Series(seasonal_pred.values().flatten(), index=seasonal_pred.time_index),
+            'residual': pd.Series(res_pred.values().flatten(), index=res_pred.time_index)
+        }
+        
+        Visualization.plot_forecast_components(target, actuals, preds, act_comps, pred_comps, OUTPUT_DIR)
         
     logger.info("Pipeline completed successfully.")
 
