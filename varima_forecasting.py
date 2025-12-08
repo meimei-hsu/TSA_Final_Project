@@ -13,7 +13,7 @@ import seaborn as sns
 
 # Darts imports
 from darts import TimeSeries
-from darts.models import VARIMA, Theta, NaiveSeasonal
+from darts.models import ARIMA, Theta, NaiveSeasonal
 from darts.metrics import smape, mase, mae, mse, rmse
 from darts.dataprocessing.transformers import Scaler, Diff, MissingValuesFiller
 from darts.utils.statistics import check_seasonality
@@ -411,82 +411,71 @@ def run_varima_pipeline():
     Visualization.plot_decomposition(components, OUTPUT_DIR)
     
     # 3. Modeling & Forecasting
-    
-    # Prepare Residuals for VARIMA (Multivariate)
-    try:
-        train_res_multi, test_res_multi = prep.prepare_multivariate_series(
-            components, 
-            train_df.index, 
-            test_df.index,
-            col_name='residual'
-        )
-        full_res_multi = train_res_multi.append(test_res_multi)
-    except ValueError as e:
-        logger.error(str(e))
-        return
-
-    # Differencing
-    diff_trasformer = Diff(lags=1)
-    train_res_cov = diff_trasformer.fit_transform(train_res_multi)
-    full_res_cov = diff_trasformer.transform(full_res_multi)
-
-    # Fill missing values
-    missing_filler = MissingValuesFiller(fill=0.0)
-    train_res_future_cov = missing_filler.transform(train_res_cov.shift(1))
-    full_res_future_cov = missing_filler.transform(full_res_cov.shift(1))
-
-    # Align target and covariates to intersection (fixes start date mismatch due to shift/diff)
-    train_res_multi = train_res_multi.slice_intersect(train_res_future_cov)
-    train_res_future_cov = train_res_future_cov.slice_intersect(train_res_multi)
-    
-    full_res_multi = full_res_multi.slice_intersect(full_res_future_cov)
-    full_res_future_cov = full_res_future_cov.slice_intersect(full_res_multi)
-        
-    # Hyperparameter Tuning for VARIMA
-    parameters = {
-        'p': [1, 2, 3],
-        'd': [0],
-        'q': [0, 1, 2],
-        'trend': ['n', 'c']
-    }
-    
-    try:
-        best_model, best_params, best_score = ModelTraining.perform_grid_search(
-            VARIMA, parameters, train_res_multi, future_covariates=train_res_future_cov
-        )
-        logger.info(f"Best VARIMA parameters: {best_params} with MSE={best_score}")
-        
-    except Exception as e:
-        logger.warning(f"Grid search failed: {str(e)}. Using default VARIMA(1,0,0)")
-        best_model = VARIMA(p=1, d=0, q=0, trend='n')
-        
-    # Fit best model on full train residuals
-    best_model.fit(train_res_multi, future_covariates=train_res_future_cov)
-    
-    # Historical Forecasts (on Test set)
-    hist_pred_res = best_model.historical_forecasts(
-        series=full_res_multi,
-        future_covariates=full_res_future_cov,
-        start=len(train_res_multi),
-        forecast_horizon=1,
-        stride=1,
-        retrain=False,
-        verbose=True
-    )
 
     # Reconstruct predictions
     for i, target in enumerate(targets):
-        if target not in components:
-            continue
-            
-        # 1. Component Predictions
-        res_pred = hist_pred_res.univariate_component(i)
+        # 1.1 Residual ARIMA Predictions
+        
+        # Prepare Residuals for ARIMA
+        full_res_uni = TimeSeries.from_series(components[target]['residual'])
+        train_res_uni = full_res_uni.drop_after(train_df.index[-1])
 
+        # Differencing
+        diff_trasformer = Diff(lags=1)
+        train_res_cov = diff_trasformer.fit_transform(train_res_uni)
+        full_res_cov = diff_trasformer.transform(full_res_uni)
+
+        # Fill missing values
+        missing_filler = MissingValuesFiller(fill=0.0)
+        train_res_future_cov = missing_filler.transform(train_res_cov.shift(1))
+        full_res_future_cov = missing_filler.transform(full_res_cov.shift(1))
+
+        # Align target and covariates to intersection (fixes start date mismatch due to shift/diff)
+        train_res_uni = train_res_uni.slice_intersect(train_res_future_cov)
+        train_res_future_cov = train_res_future_cov.slice_intersect(train_res_uni)
+        
+        full_res_uni = full_res_uni.slice_intersect(full_res_future_cov)
+        full_res_future_cov = full_res_future_cov.slice_intersect(full_res_uni)
+            
+        # Hyperparameter Tuning for ARIMA
+        parameters = {
+            'p': [1, 2, 3],
+            'd': [0],
+            'q': [0, 1, 2],
+            'trend': ['n', 'c']
+        }
+        
+        try:
+            best_model, best_params, best_score = ModelTraining.perform_grid_search(
+                ARIMA, parameters, train_res_uni, future_covariates=train_res_future_cov
+            )
+            logger.info(f"Best ARIMA parameters: {best_params} with MSE={best_score}")
+            
+        except Exception as e:
+            logger.warning(f"Grid search failed: {str(e)}. Using default ARIMA(1,0,0)")
+            best_model = ARIMA(p=1, d=0, q=0, trend='n')
+            
+        # Fit best model on full train residuals
+        best_model.fit(train_res_uni, future_covariates=train_res_future_cov)
+        
+        # Historical Forecasts (on Test set)
+        residual_pred = best_model.historical_forecasts(
+            series=full_res_uni,
+            future_covariates=full_res_future_cov,
+            start=len(train_res_uni),
+            forecast_horizon=1,
+            stride=1,
+            retrain=False,
+            verbose=True
+        )
+
+        # 1.2 Trend Predictions
         trend_pred = ModelTraining.forecast_trend(
             series=components[target]['trend'],
             train_split_date=train_df.index[-1]
         )
         
+        # 1.3 Seasonal Predictions
         seasonal_pred = ModelTraining.forecast_seasonal(
             series=components[target]['seasonal'],
             train_split_date=train_df.index[-1],
@@ -494,7 +483,7 @@ def run_varima_pipeline():
         )
         
         # 2. Reconstruct Prediction
-        final_pred_series = ModelTraining.combine_predictions([trend_pred, seasonal_pred, res_pred])
+        final_pred_series = ModelTraining.combine_predictions([trend_pred, seasonal_pred, residual_pred])
         common_index = final_pred_series.time_index
 
         # Get Actuals
@@ -515,7 +504,7 @@ def run_varima_pipeline():
         pred_comps = {
             'trend': pd.Series(trend_pred.values().flatten(), index=trend_pred.time_index),
             'seasonal': pd.Series(seasonal_pred.values().flatten(), index=seasonal_pred.time_index),
-            'residual': pd.Series(res_pred.values().flatten(), index=res_pred.time_index)
+            'residual': pd.Series(residual_pred.values().flatten(), index=residual_pred.time_index)
         }
         
         Visualization.plot_forecast_components(target, actuals, preds, act_comps, pred_comps, OUTPUT_DIR)
