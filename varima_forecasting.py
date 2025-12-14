@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore")
 # Constants
 DATA_DIR = Path("Price_Daily.csv")
 OUTPUT_DIR = Path("output/varima_run")
-TARGETS = ["Target_Naphtha_Price_Close", "Target_Ethylene_NEAsia_Price_Close"]
+TARGETS = ["Target_Ethylene_NEAsia_Price_Close", "Target_Naphtha_Price_Close", "Upstream_Crudeoil_WTI_Price_Close", "Upstream_Crudeoil_Brent_Price_Close", "Upstream_Crudeoil_Dubai_Price_Close"]
 DATE_RANGE = ["2021-02-05", "2025-06-30"]
 TEST_SPLIT_DATE = "2024-07-01"
 SEASONAL_PERIOD = 26
@@ -458,42 +458,36 @@ def run_varima_pipeline():
     
     # 3. Modeling & Forecasting
 
-    # Fit VARIMA models
-    res_pred_multi = ModelTraining.fit_and_pred_varima(
-        components, 
-        train_index=train_df.index, 
-        target_cols=targets,
-        comp_name='residual',
-        param_grid={
-            'p': [1, 2, 3],
-            'd': [0],
-            'q': [0, 1, 2],
-            'trend': ['n', 'c']
-        }
-    )
-
-    trend_pred_multi = ModelTraining.fit_and_pred_varima(
-        components, 
-        train_index=train_df.index, 
-        target_cols=targets,
-        comp_name='trend',
-        param_grid={
-            'p': [1, 2, 3],
-            'd': [1],
-            'q': [6, 7, 8],
-            'trend': ['c']
-        }
-    )
-
     # Reconstruct predictions
-    for i, target in enumerate(targets):
-        if target not in components:
-            continue
-            
-        # 1. Component Predictions
-        res_pred = res_pred_multi.univariate_component(i)
+    for i, target_cols in enumerate([targets[:2], targets[1:]]):
+        target = target_cols[0]
 
-        trend_pred = trend_pred_multi.univariate_component(i)
+        # 1. Component Predictions
+        res_pred = ModelTraining.fit_and_pred_varima(
+            components, 
+            train_index=train_df.index, 
+            target_cols=target_cols,
+            comp_name='residual',
+            param_grid={
+                'p': [1, 2, 3],
+                'd': [0],
+                'q': [0, 1, 2],
+                'trend': ['n', 'c']
+            }
+        ).univariate_component(0)
+
+        trend_pred = ModelTraining.fit_and_pred_varima(
+            components, 
+            train_index=train_df.index, 
+            target_cols=target_cols,
+            comp_name='trend',
+            param_grid={
+                'p': [1, 2, 3],
+                'd': [1],
+                'q': [6, 7, 8],
+                'trend': ['c']
+            }
+        ).univariate_component(0)
         
         seasonal_pred = ModelTraining.forecast_seasonal(
             series=components[target]['seasonal'],
