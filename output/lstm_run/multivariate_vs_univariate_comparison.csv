@@ -1,0 +1,5 @@
+Target,Model,SMAPE (%),MDA (%),MAE,RMSE,Hidden_Dim,N_Layers,Input_Chunk
+Naphtha,Multivariate,2.45,49.02,15.3704,21.6758,128,2,20
+Naphtha,Univariate,2.39,49.02,15.0387,20.9663,32,3,8
+Ethylene,Multivariate,0.97,56.86,8.1866,11.3635,128,2,20
+Ethylene,Univariate,1.00,45.10,8.4412,10.7340,64,3,20
