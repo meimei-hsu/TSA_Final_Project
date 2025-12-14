@@ -13,7 +13,7 @@ import seaborn as sns
 
 # Darts imports
 from darts import TimeSeries
-from darts.models import VARIMA, Theta, NaiveSeasonal
+from darts.models import VARIMA, NaiveSeasonal
 from darts.metrics import smape, mase, mae, mse, rmse
 from darts.dataprocessing.transformers import Scaler, Diff, MissingValuesFiller
 from darts.utils.statistics import check_seasonality
@@ -147,33 +147,6 @@ class DataPreparation:
             
         return components
 
-    def prepare_multivariate_series(self, data: Dict[str, pd.DataFrame], train_index: pd.Index, 
-                                    test_index: pd.Index, col_name: str) -> Tuple[TimeSeries, TimeSeries]:
-        """
-        Prepare multivariate TimeSeries from a dictionary of DataFrames.
-        """
-        # Collect relevant series
-        series_list = []
-        for target in self.target_cols:
-            if target in data and col_name in data[target].columns:
-                series_list.append(data[target][col_name].rename(target))
-        
-        if not series_list:
-            raise ValueError(f"No valid data found for column '{col_name}'")
-            
-        # Create unified DataFrame (inner join for alignment)
-        multi_df = pd.concat(series_list, axis=1, join='inner')
-        
-        # Split based on provided indices
-        train_df = multi_df.loc[multi_df.index.isin(train_index)]
-        test_df = multi_df.loc[multi_df.index.isin(test_index)]
-        
-        if train_df.empty:
-            raise ValueError("Training set is empty after alignment")
-            
-        # Convert to Darts TimeSeries
-        return TimeSeries.from_dataframe(train_df), TimeSeries.from_dataframe(test_df)
-
 
 class ModelTraining:
     """
@@ -201,31 +174,84 @@ class ModelTraining:
             past_covariates=past_covariates,
             future_covariates=future_covariates,
             val_series=val,
-            metric=metric
+            metric=metric,
+            verbose=True
         )
 
     @staticmethod
-    def forecast_trend(
-        series: pd.Series, 
-        train_split_date: Any
-    ) -> TimeSeries:
+    def fit_and_pred_varima(data: Dict[str, pd.DataFrame], train_index: pd.Index, 
+                            param_grid: Dict[str, Any], comp_name: str, target_cols: List[str]) -> TimeSeries:
         """
-        Fits a Theta model to extrapolate the trend. 
+        Fit and predict VARIMA model.
         """
-        full_trend_ts = TimeSeries.from_series(series)
-        train_trend_ts = full_trend_ts.drop_after(train_split_date)
+
+        # Collect relevant series
+        series_list = []
+        for target in target_cols:
+            if target in data and comp_name in data[target].columns:
+                series_list.append(data[target][comp_name].rename(target))
         
-        # Theta(2) is equivalent to linear extrapolation
-        model = Theta(theta=2, season_mode=SeasonalityMode.NONE) 
+        if not series_list:
+            raise ValueError(f"No valid data found for column '{comp_name}'")
+            
+        # Create unified DataFrame (inner join for alignment)
+        full_df = pd.concat(series_list, axis=1, join='inner')
+        train_df = full_df.loc[full_df.index.isin(train_index)]
         
-        return model.historical_forecasts(
-            series=full_trend_ts,
-            start=len(train_trend_ts),
+        if train_df.empty:
+            raise ValueError("Training set is empty after alignment")
+
+        # Convert to Darts TimeSeries
+        train_multi = TimeSeries.from_dataframe(train_df)
+        full_multi = TimeSeries.from_dataframe(full_df)
+
+        # Differencing
+        diff_transformer = Diff(lags=1)
+        train_cov = diff_transformer.fit_transform(train_multi)
+        full_cov = diff_transformer.transform(full_multi)
+
+        # Shift covariates
+        train_future_cov = train_cov.shift(1)
+        full_future_cov = full_cov.shift(1)
+
+        # Fill missing values
+        missing_filler = MissingValuesFiller(fill=0.0)
+        train_future_cov = missing_filler.transform(train_future_cov)
+        full_future_cov = missing_filler.transform(full_future_cov)
+
+        # Align target and covariates to intersection (fixes start date mismatch due to shift/diff)
+        train_multi = train_multi.slice_intersect(train_future_cov)
+        train_future_cov = train_future_cov.slice_intersect(train_multi)
+        
+        full_multi = full_multi.slice_intersect(full_future_cov)
+        full_future_cov = full_future_cov.slice_intersect(full_multi)
+
+        # Hyperparameter Tuning for VARIMA
+        try:
+            best_model, best_params, best_score = ModelTraining.perform_grid_search(
+                VARIMA, param_grid, train_multi, future_covariates=train_future_cov
+            )
+            logger.info(f"Best VARIMA parameters: {best_params} with MSE={best_score}")
+            
+        except Exception as e:
+            logger.warning(f"Grid search failed: {str(e)}\nUsing default VARIMA(1,0,0)")
+            best_model = VARIMA(p=1, d=0, q=0, trend='n')
+            
+        # Fit best model on full train residuals
+        best_model.fit(train_multi, future_covariates=train_future_cov)
+
+        # Historical Forecasts (on Test set)
+        pred_multi = best_model.historical_forecasts(
+            series=full_multi,
+            future_covariates=full_future_cov,
+            start=len(train_multi),
             forecast_horizon=1,
             stride=1,
-            retrain=True,
-            verbose=False
+            retrain=False,
+            verbose=True
         )
+        
+        return pred_multi
 
     @staticmethod
     def forecast_seasonal(
@@ -411,67 +437,32 @@ def run_varima_pipeline():
     Visualization.plot_decomposition(components, OUTPUT_DIR)
     
     # 3. Modeling & Forecasting
-    
-    # Prepare Residuals for VARIMA (Multivariate)
-    try:
-        train_res_multi, test_res_multi = prep.prepare_multivariate_series(
-            components, 
-            train_df.index, 
-            test_df.index,
-            col_name='residual'
-        )
-        full_res_multi = train_res_multi.append(test_res_multi)
-    except ValueError as e:
-        logger.error(str(e))
-        return
 
-    # Differencing
-    diff_trasformer = Diff(lags=1)
-    train_res_cov = diff_trasformer.fit_transform(train_res_multi)
-    full_res_cov = diff_trasformer.transform(full_res_multi)
+    # Fit VARIMA models
+    res_pred_multi = ModelTraining.fit_and_pred_varima(
+        components, 
+        train_index=train_df.index, 
+        target_cols=targets,
+        comp_name='residual',
+        param_grid={
+            'p': [1, 2, 3],
+            'd': [0],
+            'q': [0, 1, 2],
+            'trend': ['n', 'c']
+        }
+    )
 
-    # Fill missing values
-    missing_filler = MissingValuesFiller(fill=0.0)
-    train_res_future_cov = missing_filler.transform(train_res_cov.shift(1))
-    full_res_future_cov = missing_filler.transform(full_res_cov.shift(1))
-
-    # Align target and covariates to intersection (fixes start date mismatch due to shift/diff)
-    train_res_multi = train_res_multi.slice_intersect(train_res_future_cov)
-    train_res_future_cov = train_res_future_cov.slice_intersect(train_res_multi)
-    
-    full_res_multi = full_res_multi.slice_intersect(full_res_future_cov)
-    full_res_future_cov = full_res_future_cov.slice_intersect(full_res_multi)
-        
-    # Hyperparameter Tuning for VARIMA
-    parameters = {
-        'p': [1, 2, 3],
-        'd': [0],
-        'q': [0, 1, 2],
-        'trend': ['n', 'c']
-    }
-    
-    try:
-        best_model, best_params, best_score = ModelTraining.perform_grid_search(
-            VARIMA, parameters, train_res_multi, future_covariates=train_res_future_cov
-        )
-        logger.info(f"Best VARIMA parameters: {best_params} with MSE={best_score}")
-        
-    except Exception as e:
-        logger.warning(f"Grid search failed: {str(e)}. Using default VARIMA(1,0,0)")
-        best_model = VARIMA(p=1, d=0, q=0, trend='n')
-        
-    # Fit best model on full train residuals
-    best_model.fit(train_res_multi, future_covariates=train_res_future_cov)
-    
-    # Historical Forecasts (on Test set)
-    hist_pred_res = best_model.historical_forecasts(
-        series=full_res_multi,
-        future_covariates=full_res_future_cov,
-        start=len(train_res_multi),
-        forecast_horizon=1,
-        stride=1,
-        retrain=False,
-        verbose=True
+    trend_pred_multi = ModelTraining.fit_and_pred_varima(
+        components, 
+        train_index=train_df.index, 
+        target_cols=targets,
+        comp_name='trend',
+        param_grid={
+            'p': [1, 2, 3],
+            'd': [1],
+            'q': [6, 7, 8],
+            'trend': ['c']
+        }
     )
 
     # Reconstruct predictions
@@ -480,12 +471,9 @@ def run_varima_pipeline():
             continue
             
         # 1. Component Predictions
-        res_pred = hist_pred_res.univariate_component(i)
+        res_pred = res_pred_multi.univariate_component(i)
 
-        trend_pred = ModelTraining.forecast_trend(
-            series=components[target]['trend'],
-            train_split_date=train_df.index[-1]
-        )
+        trend_pred = trend_pred_multi.univariate_component(i)
         
         seasonal_pred = ModelTraining.forecast_seasonal(
             series=components[target]['seasonal'],
