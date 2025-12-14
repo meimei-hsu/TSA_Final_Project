@@ -13,7 +13,7 @@ import seaborn as sns
 
 # Darts imports
 from darts import TimeSeries
-from darts.models import VARIMA, Theta, NaiveSeasonal
+from darts.models import VARIMA, NaiveSeasonal
 from darts.metrics import smape, mase, mae, mse, rmse
 from darts.dataprocessing.transformers import Scaler, Diff, MissingValuesFiller
 from darts.utils.statistics import check_seasonality
@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore")
 # Constants
 DATA_DIR = Path("Price_Daily.csv")
 OUTPUT_DIR = Path("output/varima_run")
-TARGETS = ["Target_Ethylene_NEAsia_Price_Close", "Target_Naphtha_Price_Close", "Upstream_Crudeoil_WTI_Price_Close", "Upstream_Crudeoil_Brent_Price_Close", "Upstream_Crudeoil_Dubai_Price_Close"]
+TARGETS = ["Target_Naphtha_Price_Close", "Target_Ethylene_NEAsia_Price_Close"]
 DATE_RANGE = ["2021-02-05", "2025-06-30"]
 TEST_SPLIT_DATE = "2024-07-01"
 SEASONAL_PERIOD = 26
@@ -210,10 +210,14 @@ class ModelTraining:
         train_cov = diff_transformer.fit_transform(train_multi)
         full_cov = diff_transformer.transform(full_multi)
 
+        # Shift covariates
+        train_future_cov = train_cov.shift(1)
+        full_future_cov = full_cov.shift(1)
+
         # Fill missing values
         missing_filler = MissingValuesFiller(fill=0.0)
-        train_future_cov = missing_filler.transform(train_cov.shift(1))
-        full_future_cov = missing_filler.transform(full_cov.shift(1))
+        train_future_cov = missing_filler.transform(train_future_cov)
+        full_future_cov = missing_filler.transform(full_future_cov)
 
         # Align target and covariates to intersection (fixes start date mismatch due to shift/diff)
         train_multi = train_multi.slice_intersect(train_future_cov)
@@ -248,30 +252,6 @@ class ModelTraining:
         )
         
         return pred_multi
-        
-
-    @staticmethod
-    def forecast_trend(
-        series: pd.Series, 
-        train_split_date: Any
-    ) -> TimeSeries:
-        """
-        Fits a Theta model to extrapolate the trend. 
-        """
-        full_trend_ts = TimeSeries.from_series(series)
-        train_trend_ts = full_trend_ts.drop_after(train_split_date)
-        
-        # Theta(2) is equivalent to linear extrapolation
-        model = Theta(theta=2, season_mode=SeasonalityMode.NONE) 
-        
-        return model.historical_forecasts(
-            series=full_trend_ts,
-            start=len(train_trend_ts),
-            forecast_horizon=1,
-            stride=1,
-            retrain=True,
-            verbose=False
-        )
 
     @staticmethod
     def forecast_seasonal(
@@ -458,36 +438,42 @@ def run_varima_pipeline():
     
     # 3. Modeling & Forecasting
 
+    # Fit VARIMA models
+    res_pred_multi = ModelTraining.fit_and_pred_varima(
+        components, 
+        train_index=train_df.index, 
+        target_cols=targets,
+        comp_name='residual',
+        param_grid={
+            'p': [1, 2, 3],
+            'd': [0],
+            'q': [0, 1, 2],
+            'trend': ['n', 'c']
+        }
+    )
+
+    trend_pred_multi = ModelTraining.fit_and_pred_varima(
+        components, 
+        train_index=train_df.index, 
+        target_cols=targets,
+        comp_name='trend',
+        param_grid={
+            'p': [1, 2, 3],
+            'd': [1],
+            'q': [6, 7, 8],
+            'trend': ['c']
+        }
+    )
+
     # Reconstruct predictions
-    for i, target_cols in enumerate([targets[:2], targets[1:]]):
-        target = target_cols[0]
-
+    for i, target in enumerate(targets):
+        if target not in components:
+            continue
+            
         # 1. Component Predictions
-        res_pred = ModelTraining.fit_and_pred_varima(
-            components, 
-            train_index=train_df.index, 
-            target_cols=target_cols,
-            comp_name='residual',
-            param_grid={
-                'p': [1, 2, 3],
-                'd': [0],
-                'q': [0, 1, 2],
-                'trend': ['n', 'c']
-            }
-        ).univariate_component(0)
+        res_pred = res_pred_multi.univariate_component(i)
 
-        trend_pred = ModelTraining.fit_and_pred_varima(
-            components, 
-            train_index=train_df.index, 
-            target_cols=target_cols,
-            comp_name='trend',
-            param_grid={
-                'p': [1, 2, 3],
-                'd': [1],
-                'q': [6, 7, 8],
-                'trend': ['c']
-            }
-        ).univariate_component(0)
+        trend_pred = trend_pred_multi.univariate_component(i)
         
         seasonal_pred = ModelTraining.forecast_seasonal(
             series=components[target]['seasonal'],
